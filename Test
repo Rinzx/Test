@@ -1,1 +1,108 @@
-H
+#
+# This class is used to process 'file share access' related events from Security Events
+#
+class FileShareDataset:
+  
+    def __init__(self, storage_conn_str):
+        self.storage_conn_str = storage_conn_str
+        self.storage_blob_manager = storage_blob_manager(storage_conn_str)
+
+    @staticmethod
+    def _make_days_delta():
+        @udf('double')
+        def days_delta(d2, d1):
+            return 1.0 + (d2 - d1).days
+        return days_delta
+    
+    # NOTE that there are a lot more fields for security events. Below we are picking up only a subset of fields
+    @staticmethod
+    def _security_event_schema():
+        return t.StructType([
+            t.StructField(name = "AccountName", dataType = t.StringType(), nullable = True), #1
+            t.StructField(name = "FileName", dataType = t.StringType(), nullable = True), #2
+            t.StructField(name = "FolderPath", dataType = t.StringType(), nullable = True), #3
+            t.StructField(name = "ActionType", dataType = t.StringType(), nullable = True), #4
+            t.StructField(name = "DeviceName", dataType = t.StringType(), nullable = True), #5
+            t.StructField(name = "InitiatingProcessId", dataType = t.StringType(), nullable = True), #6
+            t.StructField(name = "InitiatingProcessCommandLine", dataType = t.StringType(), nullable = True), #7
+            t.StructField(name = "ProcessId", dataType = t.StringType(), nullable = True), #8
+            t.StructField(name = "ProcessIntegrityLevel", dataType = t.StringType(), nullable = True), #9
+            t.StructField(name = "InitiatingProcessParentFileName", dataType = t.StringType(), nullable = True), #10
+            t.StructField(name = "ProcessCommandLine", dataType = t.StringType(), nullable = True), #11
+            t.StructField(name = "InitiatingProcessParentId", dataType = t.StringType(), nullable = True), #12
+            t.StructField(name = "InitiatingProcessIntegrityLevel", dataType = t.StringType(), nullable = True), #17
+            t.StructField(name = "SourceSystem", dataType = t.StringType(), nullable = True), #18
+            t.StructField(name = "MachineGroup", dataType = t.StringType(), nullable = True), #19
+            t.StructField(name = "AccountDomain", dataType = t.StringType(), nullable = True), #20
+            t.StructField(name = "LogonId", dataType = t.StringType(), nullable = True), #21
+            t.StructField(name = "InitiatingProcessSignatureStatus", dataType = t.StringType(), nullable = True), #22
+            t.StructField(name = "ProcessVersionInfoFileDescription", dataType = t.StringType(), nullable = True), #23
+            t.StructField(name = "ProcessVersionInfoOriginalFileName", dataType = t.StringType(), nullable = True), #24
+            t.StructField(name = "InitiatingProcessAccountDomain", dataType = t.StringType(), nullable = True), #25
+            t.StructField(name = "InitiatingProcessTokenElevation", dataType = t.StringType(), nullable = True), #26
+            t.StructField(name = "InitiatingProcessFileName", dataType = t.StringType(), nullable = True), #27
+            t.StructField(name = "AccountSid", dataType = t.StringType(), nullable = True),
+            t.StructField(name = "TenantId", dataType = t.StringType(), nullable = True), #13
+            t.StructField(name = "Timestamp", dataType = t.StringType(), nullable = True), #14
+            t.StructField(name = "TimeGenerated", dataType = t.StringType(), nullable = True), #15
+            t.StructField(name = "ProcessTokenElevation", dataType = t.StringType(), nullable = True), #16
+        ])
+
+    # Get file share access data from security events
+    def get_fs_dataset(self, start_time, end_time, container, root):   
+        raw_df = self.storage_blob_manager.get_raw_df(
+                                        start_time, 
+                                        end_time, 
+                                        container, 
+                                        root, 
+                                        FileShareDataset._security_event_schema(), 
+                                        storage_blob_manager.get_blob_service_client(self.storage_conn_str) )
+        # Get FileShare access events
+        return raw_df.where(
+                    f.col('InitiatingProcessFileName') == 'powershell.exe'
+                 ).select (
+                    f.lit('0').alias('tenant_id'),
+                    f.col('TimeGenerated'),
+                    f.to_date(f.col('TimeGenerated').cast('timestamp')).cast('timestamp').alias('Timestamp'), # timestamp is set at day 00:00
+                    f.col('AccountName').alias('user'),
+                    f.col('FileName').alias('res'),
+                 )
+    
+    # group the file share access per day and assign an initial likelyhood score
+    def get_processed_fs_dataset(self, start_time, end_time, container, root):
+        dd = FileShareDataset._make_days_delta()
+
+        df_fs = self.get_fs_dataset(start_time, end_time, container, root)
+        
+        # group fileshare access events per day
+        daily_fs_activity = df_fs.groupBy(
+                                'tenant_id',
+                                'Timestamp',
+                                'user',
+                                'res'
+                            ).count()
+        
+        # Calculate an initial likelihood score based on count of events
+        return daily_fs_activity.select(
+            f.col('tenant_id'),
+            f.col('Timestamp').alias('timestamp1'),
+            f.col('Timestamp').alias('timestamp2'),
+            'user',
+            'res',
+            'count'
+        ).groupBy(
+            'tenant_id',
+            'user',
+            'res'
+        ).agg({
+            'timestamp1': 'min',
+            'timestamp2': 'max',
+            'count': 'sum'
+        }).select(
+            f.col('tenant_id'),
+            f.col('min(timestamp1)').alias('min_timestamp'),
+            f.col('max(timestamp2)').alias('max_timestamp'),
+            f.col('user'),
+            f.col('res'),
+            (f.col('sum(count)')/dd(f.col('max(timestamp2)'), f.col('min(timestamp1)'))).alias('likelihood')
+        )
